@@ -28,6 +28,29 @@ from plugins.platforms.homeassistant.adapter import (
 
 class TestCheckRequirements:
 
+    def test_explicit_enabled_false_wins_over_hass_token(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.config import Platform, load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n  homeassistant:\n    enabled: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HASS_TOKEN", "test-token")
+        monkeypatch.setenv("HASS_URL", "http://ha.local:8123")
+
+        config = load_gateway_config()
+
+        homeassistant = config.platforms[Platform.HOMEASSISTANT]
+        assert homeassistant.enabled is False
+        assert homeassistant.token == "test-token"
+        assert homeassistant.extra["url"] == "http://ha.local:8123"
+        assert "_enabled_explicit" not in homeassistant.extra
+
 
     @patch("plugins.platforms.homeassistant.adapter.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self, monkeypatch):

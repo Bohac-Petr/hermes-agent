@@ -20,6 +20,34 @@ from gateway.config import Platform, PlatformConfig
 class TestSmsConfigLoading:
     """Verify _apply_env_overrides wires SMS correctly."""
 
+    def test_explicit_enabled_false_wins_over_twilio_credentials(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.config import load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n  sms:\n    enabled: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACtest123")
+        monkeypatch.setenv("TWILIO_AUTH_TOKEN", "token_abc")
+
+        config = load_gateway_config()
+
+        sms = config.platforms[Platform.SMS]
+        assert sms.enabled is False
+        assert sms.api_key == "token_abc"
+        assert "_enabled_explicit" not in sms.extra
+
+        from plugins.platforms.sms.adapter import SmsAdapter
+
+        adapter = SmsAdapter(sms)
+        assert adapter._account_sid == "ACtest123"
+        assert adapter._auth_token == "token_abc"
+
 
     def test_env_overrides_set_home_channel(self):
         from gateway.config import load_gateway_config

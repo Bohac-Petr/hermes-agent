@@ -13,7 +13,9 @@ Covers:
 """
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -25,6 +27,39 @@ from gateway.platforms.base import SendResult
 
 class TestConfigEnvOverrides(unittest.TestCase):
     """Verify email config is loaded from environment variables."""
+
+    def test_explicit_enabled_false_wins_over_email_credentials(self):
+        from gateway.config import Platform, load_gateway_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_home = Path(tmp)
+            (hermes_home / "config.yaml").write_text(
+                "platforms:\n  email:\n    enabled: false\n",
+                encoding="utf-8",
+            )
+            env = {
+                "HERMES_HOME": str(hermes_home),
+                "EMAIL_ADDRESS": "hermes@test.com",
+                "EMAIL_PASSWORD": "secret",
+                "EMAIL_IMAP_HOST": "imap.test.com",
+                "EMAIL_SMTP_HOST": "smtp.test.com",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                config = load_gateway_config()
+                from plugins.platforms.email.adapter import EmailAdapter
+
+                adapter = EmailAdapter(config.platforms[Platform.EMAIL])
+
+        email = config.platforms[Platform.EMAIL]
+        self.assertFalse(email.enabled)
+        self.assertEqual(email.extra["address"], "hermes@test.com")
+        self.assertEqual(email.extra["imap_host"], "imap.test.com")
+        self.assertEqual(email.extra["smtp_host"], "smtp.test.com")
+        self.assertNotIn("_enabled_explicit", email.extra)
+        self.assertEqual(adapter._address, "hermes@test.com")
+        self.assertEqual(adapter._password, "secret")
+        self.assertEqual(adapter._imap_host, "imap.test.com")
+        self.assertEqual(adapter._smtp_host, "smtp.test.com")
 
 
     @patch.dict(os.environ, {
