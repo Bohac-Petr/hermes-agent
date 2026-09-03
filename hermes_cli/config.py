@@ -3724,6 +3724,127 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+class ConfigResolutionError(RuntimeError):
+    """The current effective config at an explicit path could not be resolved.
+
+    Raised by :func:`resolve_effective_config_value` when a present config
+    source fails to read/parse, or when a requested dotted path crosses a
+    non-mapping value. Safety-sensitive consumers use this to distinguish a
+    genuine default from a broken source (fail closed), where the general
+    ``load_config()`` pipeline would fall back to last-known-good/defaults.
+    """
+
+
+# (path, mtime_ns, size, ctime_ns, mode) -> resolved value for
+# resolve_effective_config_value. Same invalidation semantics as
+# _LOAD_CONFIG_CACHE: any content or permission metadata change forces a
+# re-resolve. Value is stored post-merge so hot callers (every SessionDB
+# open) skip yaml parse + merge + expansion on unchanged files.
+_RESOLVED_VALUE_CACHE: Dict[str, Tuple[int, int, int, int, Any]] = {}
+
+
+def resolve_effective_config_value(
+    config_path: Path,
+    *keys: str,
+    default: Any = None,
+) -> Any:
+    """Resolve one value from an explicit config path, strictly.
+
+    This is the public boundary for behavioral readers that own an explicit
+    ``config.yaml`` path rather than the process-global ``HERMES_HOME``
+    (e.g. SessionDB resolving ``sessions.trigram_fts`` from the config
+    adjacent to each state.db). It applies the same defaults merge,
+    root-model normalization, ``${VAR}`` expansion and managed overlay as
+    :func:`load_config` — sharing that pipeline's primitives — while the
+    caller picks the file.
+
+    Semantics:
+
+    * missing config file → successful resolution of defaults;
+    * a present config that cannot be read or parsed →
+      :class:`ConfigResolutionError` (no last-known-good fallback: explicit-
+      path consumers must fail closed rather than silently flip a safety
+      setting);
+    * a dotted path crossing a non-mapping value →
+      :class:`ConfigResolutionError`;
+    * missing leaf key → ``default``.
+
+    The resolved value is cached per path on (mtime, size, ctime, mode) so
+    repeated opens are cheap; only the selected value is returned (copied
+    when mutable), so callers cannot mutate the shared cache.
+    """
+    config_path = Path(config_path).expanduser()
+    try:
+        st = config_path.stat()
+        sig: Optional[Tuple[int, int, int, int]] = (
+            st.st_mtime_ns, st.st_size, st.st_ctime_ns, st.st_mode,
+        )
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError):
+            sig = None  # absent file: defaults, resolved fresh every call
+        else:
+            raise ConfigResolutionError(
+                f"Config source at {config_path} is inaccessible: {exc}"
+            ) from exc
+
+    path_key = str(config_path)
+    if sig is not None:
+        cached = _RESOLVED_VALUE_CACHE.get(path_key)
+        if cached is not None and cached[:4] == sig:
+            value = cached[4]
+            return copy.deepcopy(value) if isinstance(value, (dict, list)) else value
+
+    config: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
+    try:
+        user_raw = read_user_config_raw(config_path)
+    except Exception as exc:
+        raise ConfigResolutionError(
+            f"Could not parse config at {config_path}: {exc}"
+        ) from exc
+    if user_raw:
+        if "max_turns" in user_raw:
+            agent_user_config = dict(user_raw.get("agent") or {})
+            if agent_user_config.get("max_turns") is None:
+                agent_user_config["max_turns"] = user_raw["max_turns"]
+            user_raw["agent"] = agent_user_config
+            user_raw.pop("max_turns", None)
+        config = _deep_merge(config, user_raw)
+    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    expanded = _expand_env_vars(normalized)
+    from hermes_cli import managed_scope
+
+    managed_config = managed_scope.load_managed_config()
+    if managed_config:
+        managed_normalized = _normalize_root_model_keys(managed_config)
+        if isinstance(managed_normalized.get("model"), str):
+            managed_normalized = dict(managed_normalized)
+            managed_normalized["model"] = {"default": managed_normalized["model"]}
+        expanded = _deep_merge(expanded, _expand_env_vars(managed_normalized))
+
+    if not keys:
+        result: Any = expanded
+    else:
+        result = default
+        current: Any = expanded
+        for key in keys:
+            if not isinstance(current, dict):
+                raise ConfigResolutionError(
+                    f"Config path {'.'.join(keys)} at {config_path} crosses "
+                    "a non-mapping value"
+                )
+            if key not in current:
+                result = default
+                break
+            current = current[key]
+        else:
+            result = current
+    if sig is not None:
+        _RESOLVED_VALUE_CACHE[path_key] = (
+            sig[0], sig[1], sig[2], sig[3], result,
+        )
+    return copy.deepcopy(result) if isinstance(result, (dict, list)) else result
+
+
 def read_raw_config_readonly() -> Dict[str, Any]:
     """Fast-path variant of ``read_raw_config()`` for callers that ONLY READ.
 
