@@ -441,6 +441,13 @@ class SessionSchemaMixin:
             _FTS_TRIGRAM_TRIGGERS,
         ).fetchone()
         self.set_meta(FTS_TRIGRAM_STALE_KEY, "1", cursor=cursor)
+        # Exactly-once per open: the earliest fail-closed decision wins.
+        # Later sections (FTS setup, stale recovery) check this instead of
+        # re-running the quarantine over triggers an earlier section of the
+        # same open already dropped — re-running could only duplicate the
+        # marker write, and a reviewer watching trigger state must never
+        # see a quarantine begin over pre-dropped triggers.
+        self._trigram_quarantined_this_open = True
         if not present and not live:
             return
         for trigger in _FTS_TRIGRAM_TRIGGERS:
@@ -509,14 +516,16 @@ class SessionSchemaMixin:
             # an existing one, so leave the schema version behind for retry.
             return trigram_exists is False
         # sessions.trigram_fts: false — the optional index is deliberately
-        # off. Drop any historical v29-era rows + triggers and leave the
-        # index absent for the disabled-open path; the version still
-        # advances so this migration never re-runs on every open.
+        # off. Fail closed WITHOUT destroying history: quarantine here (the
+        # stale marker is persisted first, then only the sync triggers are
+        # dropped) and leave the historical v29-era table, view and rows
+        # byte-for-byte. Physical retirement belongs to the explicit
+        # ``optimize-storage`` maintenance path, never an ordinary open; the
+        # version still advances so this migration does not re-run on every
+        # open. The FTS-setup section below honors this same quarantine
+        # (exactly-once guard) instead of repeating it.
         if not getattr(self, "_trigram_enabled", True):
-            for name in _FTS_TRIGRAM_TRIGGERS:
-                cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
-            cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
-            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            self._quarantine_trigram_schema(cursor)
             return True
         for name in _FTS_TRIGRAM_TRIGGERS:
             cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
@@ -1738,7 +1747,9 @@ class SessionSchemaMixin:
                     cursor, legacy=legacy_fts
                 )
             if self._fts_stale:
-                if not getattr(self, "_trigram_enabled", True):
+                if not getattr(self, "_trigram_enabled", True) and not getattr(
+                    self, "_trigram_quarantined_this_open", False
+                ):
                     self._quarantine_trigram_schema(cursor)
                 if self._recover_stale_fts(cursor, legacy=legacy_fts):
                     # CJK was detached alongside the corrupt base indexes and
@@ -1806,7 +1817,10 @@ class SessionSchemaMixin:
                             (FTS_TRIGRAM_STALE_KEY,),
                         )
                     else:
-                        self._quarantine_trigram_schema(cursor)
+                        if not getattr(
+                            self, "_trigram_quarantined_this_open", False
+                        ):
+                            self._quarantine_trigram_schema(cursor)
             else:
                 # Same split as the legacy branch above, same reason —
                 # including why the halves stay separate (see above).
@@ -1862,7 +1876,10 @@ class SessionSchemaMixin:
                             (FTS_TRIGRAM_STALE_KEY,),
                         )
                     else:
-                        self._quarantine_trigram_schema(cursor)
+                        if not getattr(
+                            self, "_trigram_quarantined_this_open", False
+                        ):
+                            self._quarantine_trigram_schema(cursor)
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)

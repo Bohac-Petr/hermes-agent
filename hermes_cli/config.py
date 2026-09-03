@@ -3735,12 +3735,120 @@ class ConfigResolutionError(RuntimeError):
     """
 
 
-# (path, mtime_ns, size, ctime_ns, mode) -> resolved value for
-# resolve_effective_config_value. Same invalidation semantics as
-# _LOAD_CONFIG_CACHE: any content or permission metadata change forces a
-# re-resolve. Value is stored post-merge so hot callers (every SessionDB
-# open) skip yaml parse + merge + expansion on unchanged files.
-_RESOLVED_VALUE_CACHE: Dict[str, Tuple[int, int, int, int, Any]] = {}
+# Strict resolution results for resolve_effective_config_value. Keyed by
+# (str(config_path)) with a value of (user_sig, managed_sig, result) where
+# the signatures capture BOTH provenance layers. This is deliberately a
+# SEPARATE namespace from the fail-open caches (load_config's
+# _LOAD_CONFIG_CACHE, managed_scope._CONFIG_CACHE): a non-strict prewarm
+# of those must never satisfy a strict lookup, and a strict failure must
+# never be remembered as a value by anyone.
+#
+# user_sig covers the user source itself (lstat identity + stat target
+# metadata: mtime_ns/size/ctime_ns/mode/uid/gid/inode/dev) so a dangling
+# symlink is distinguishable from a genuinely absent path, and an atomic
+# replace / chmod / chown invalidates. managed_sig carries the same
+# metadata for the managed overlay source (or ("absent",) when no managed
+# scope is configured), so a repaired/broken/removed managed file
+# invalidates the strict result.
+_RESOLVED_VALUE_CACHE: Dict[str, Tuple[Tuple, Tuple, Any]] = {}
+
+
+def _strict_source_signature(path: Path) -> Tuple:
+    """Strict provenance signature for one config source path.
+
+    Returns ``("absent",)`` only for a genuinely-absent path that is also
+    NOT a symlink (the safe "use defaults" case). A dangling symlink is a
+    dangling *source*, not an absent one: ``stat()`` through it fails with
+    ENOENT exactly like a missing file, which is the fail-open hole this
+    closes — ``lstat`` first distinguishes the two. Anything else that is
+    present but not a readable regular file (directories, fifo, socket,
+    unreadable permissions) raises ``ConfigResolutionError``.
+    """
+    try:
+        lst = path.lstat()
+    except FileNotFoundError:
+        return ("absent",)  # nothing at all at this path — safe default
+    except OSError as exc:
+        raise ConfigResolutionError(
+            f"Config source at {path} is inaccessible: {exc}"
+        ) from exc
+    if stat.S_ISLNK(lst.st_mode):
+        # A symlink is resolved to its target: absent target = dangling
+        # source, which must fail closed (the operator's config is lost,
+        # not absent). Target identity — not the link's — keys the cache
+        # so repointing the link invalidates.
+        try:
+            stt = path.stat()
+        except FileNotFoundError as exc:
+            raise ConfigResolutionError(
+                f"Config source at {path} is a dangling symlink "
+                f"(target missing): {exc}"
+            ) from exc
+        except OSError as exc:
+            raise ConfigResolutionError(
+                f"Config source at {path} is an inaccessible symlink: {exc}"
+            ) from exc
+        target = (
+            stt.st_mtime_ns, stt.st_size, stt.st_ctime_ns, stt.st_mode,
+            stt.st_ino, stt.st_dev, stt.st_uid, stt.st_gid,
+        )
+        return ("symlink", target)
+    if not stat.S_ISREG(lst.st_mode):
+        raise ConfigResolutionError(
+            f"Config source at {path} is not a regular file "
+            f"(mode {stat.S_IFMT(lst.st_mode):o})"
+        )
+    return (
+        "regular",
+        lst.st_mtime_ns, lst.st_size, lst.st_ctime_ns, lst.st_mode,
+        lst.st_ino, lst.st_dev, lst.st_uid, lst.st_gid,
+    )
+
+
+def _read_user_config_strict(config_path: Path) -> Dict[str, Any]:
+    """Read + parse the user config at ``config_path``, strictly.
+
+    Raises :class:`ConfigResolutionError` on any unreadable/unparseable
+    source or a non-mapping YAML root. Unlike :func:`read_user_config_raw`
+    (which normalizes broken roots to ``{}`` for fail-open callers), a
+    present-but-broken source is an error here: normalizing ``[]`` or a
+    scalar root to ``{}`` would silently discard the user's entire config
+    and resolve every knob to its default.
+    """
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = fast_safe_load(f)
+    except OSError as exc:
+        raise ConfigResolutionError(
+            f"Config source at {config_path} could not be read: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise ConfigResolutionError(
+            f"Could not parse config at {config_path}: {exc}"
+        ) from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigResolutionError(
+            f"Config at {config_path} has a non-mapping root "
+            f"({type(data).__name__}); refusing to resolve from defaults"
+        )
+    return data
+
+
+def _read_managed_config_strict() -> Tuple[Tuple, Dict[str, Any]]:
+    """Strict managed-overlay read: (provenance signature, parsed config).
+
+    Uses :func:`hermes_cli.managed_scope.load_managed_config_strict` — a
+    public strict sibling of the fail-open ``load_managed_config`` — so the
+    general fail-open semantics of existing callers are untouched. No
+    managed scope configured is the common case and is a clean ``{}``.
+    A configured-but-broken managed source raises
+    :class:`ConfigResolutionError` (admin policy is broken, not absent).
+    """
+    from hermes_cli import managed_scope
+
+    return managed_scope.load_managed_config_strict()
 
 
 def resolve_effective_config_value(
@@ -3760,62 +3868,54 @@ def resolve_effective_config_value(
 
     Semantics:
 
-    * missing config file → successful resolution of defaults;
-    * a present config that cannot be read or parsed →
-      :class:`ConfigResolutionError` (no last-known-good fallback: explicit-
-      path consumers must fail closed rather than silently flip a safety
-      setting);
+    * a config path that genuinely does not exist (and is not a symlink)
+      → successful resolution of defaults;
+    * a present config that cannot be read or parsed (dangling symlink,
+      unreadable, non-regular, malformed YAML, non-mapping root), or a
+      broken managed overlay source → :class:`ConfigResolutionError` (no
+      last-known-good fallback: explicit-path consumers must fail closed
+      rather than silently flip a safety setting);
     * a dotted path crossing a non-mapping value →
       :class:`ConfigResolutionError`;
     * missing leaf key → ``default``.
 
-    The resolved value is cached per path on (mtime, size, ctime, mode) so
-    repeated opens are cheap; only the selected value is returned (copied
-    when mutable), so callers cannot mutate the shared cache.
+    Results are cached per path on a strict-only signature covering BOTH
+    the user source identity (lstat + target metadata: atomic replace,
+    chmod, chown, symlink repoint all invalidate) and the managed source
+    provenance, so non-strict fail-open reads elsewhere in the process can
+    neither satisfy nor poison a strict lookup. Only the selected value is
+    returned (copied when mutable), so callers cannot mutate the cache.
     """
     config_path = Path(config_path).expanduser()
-    try:
-        st = config_path.stat()
-        sig: Optional[Tuple[int, int, int, int]] = (
-            st.st_mtime_ns, st.st_size, st.st_ctime_ns, st.st_mode,
-        )
-    except OSError as exc:
-        if isinstance(exc, FileNotFoundError):
-            sig = None  # absent file: defaults, resolved fresh every call
-        else:
-            raise ConfigResolutionError(
-                f"Config source at {config_path} is inaccessible: {exc}"
-            ) from exc
+    user_sig = _strict_source_signature(config_path)
+    managed_sig, _ = _read_managed_config_strict()
 
     path_key = str(config_path)
-    if sig is not None:
-        cached = _RESOLVED_VALUE_CACHE.get(path_key)
-        if cached is not None and cached[:4] == sig:
-            value = cached[4]
-            return copy.deepcopy(value) if isinstance(value, (dict, list)) else value
+    cached = _RESOLVED_VALUE_CACHE.get(path_key)
+    if cached is not None and cached[0] == user_sig and cached[1] == managed_sig:
+        value = cached[2]
+        return copy.deepcopy(value) if isinstance(value, (dict, list)) else value
 
     config: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
-    try:
-        user_raw = read_user_config_raw(config_path)
-    except Exception as exc:
-        raise ConfigResolutionError(
-            f"Could not parse config at {config_path}: {exc}"
-        ) from exc
-    if user_raw:
-        if "max_turns" in user_raw:
-            agent_user_config = dict(user_raw.get("agent") or {})
-            if agent_user_config.get("max_turns") is None:
-                agent_user_config["max_turns"] = user_raw["max_turns"]
-            user_raw["agent"] = agent_user_config
-            user_raw.pop("max_turns", None)
-        config = _deep_merge(config, user_raw)
-    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-    expanded = _expand_env_vars(normalized)
     from hermes_cli import managed_scope
 
-    managed_config = managed_scope.load_managed_config()
-    if managed_config:
-        managed_normalized = _normalize_root_model_keys(managed_config)
+    if user_sig != ("absent",):
+        user_raw = _read_user_config_strict(config_path)
+        if user_raw:
+            if "max_turns" in user_raw:
+                agent_user_config = dict(user_raw.get("agent") or {})
+                if agent_user_config.get("max_turns") is None:
+                    agent_user_config["max_turns"] = user_raw["max_turns"]
+                user_raw["agent"] = agent_user_config
+                user_raw.pop("max_turns", None)
+            config = _deep_merge(config, user_raw)
+    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    expanded = _expand_env_vars(normalized)
+    # managed_sig already proves the managed source parsed to a mapping
+    # (load_managed_config_strict raised otherwise); no need to re-read.
+    managed_raw = managed_scope.cached_managed_config_for(managed_sig)
+    if managed_raw:
+        managed_normalized = _normalize_root_model_keys(managed_raw)
         if isinstance(managed_normalized.get("model"), str):
             managed_normalized = dict(managed_normalized)
             managed_normalized["model"] = {"default": managed_normalized["model"]}
@@ -3838,10 +3938,7 @@ def resolve_effective_config_value(
             current = current[key]
         else:
             result = current
-    if sig is not None:
-        _RESOLVED_VALUE_CACHE[path_key] = (
-            sig[0], sig[1], sig[2], sig[3], result,
-        )
+    _RESOLVED_VALUE_CACHE[path_key] = (user_sig, managed_sig, result)
     return copy.deepcopy(result) if isinstance(result, (dict, list)) else result
 
 
